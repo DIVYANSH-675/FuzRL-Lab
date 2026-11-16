@@ -29,3 +29,8 @@ swanlog/
 *.tmp
 *.bak
 
+
+.env
+.env.*
+!.env.example
+evaluation.json

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=45", "wheel"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.black]
@@ -47,3 +47,33 @@ module = [
     "gymnasium.*",
 ]
 ignore_missing_imports = true
+
+[project]
+name = "fuzrl-lab"
+version = "0.2.0"
+description = "Reproducible experiments and reliability fixes for Fuz-RL"
+requires-python = ">=3.10"
+readme = "README.md"
+license = {file = "LICENSE"}
+dependencies = [
+    "torch>=2.0", "numpy>=1.23,<2", "scipy>=1.9", "gymnasium>=0.28,<2",
+    "joblib>=1.2", "cloudpickle>=2", "psutil>=5.9", "tqdm>=4.64",
+]
+
+[project.optional-dependencies]
+safety = ["safety-gymnasium>=1.2"]
+mpi = ["mpi4py>=3.1"]
+tracking = ["swanlab"]
+plots = ["matplotlib>=3.5", "seaborn>=0.11", "pandas>=1.3"]
+dev = ["pytest>=7", "build>=1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["spinup*"]
+namespaces = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools]
+license-files = ["LICENSE", "src/LICENSE", "ADDITIONS_LICENSE"]

@@ -1,6 +1,9 @@
 import numpy as np
 import scipy.signal
-from gym.spaces import Box, Discrete
+try:
+    from gym.spaces import Box, Discrete
+except ImportError:
+    from gymnasium.spaces import Box, Discrete
 from gymnasium.spaces import Box as SafeBox
 from gymnasium.spaces import Discrete as SafeDiscrete
 
@@ -113,7 +116,6 @@ class MLPActorCritic(nn.Module):
         super().__init__()
 
         obs_dim = observation_space.shape[0]
-        print("action_space", action_space)
         # policy builder depends on action space
         if isinstance(action_space, Box) or isinstance(action_space, SafeBox):
             self.pi = MLPGaussianActor(obs_dim, action_space.shape[0], hidden_sizes, activation)
@@ -134,7 +136,9 @@ class MLPActorCritic(nn.Module):
         return a.cpu().numpy(), v.cpu().numpy(), vc.cpu().numpy(), logp_a.cpu().numpy()
 
     def act(self, obs, deterministic=False):
-        if not deterministic:
-            return self.step(obs)[0]
-        else:
-            return self.pi.mu_net(obs)
+        with torch.no_grad():
+            if not deterministic:
+                return self.step(obs)[0]
+            distribution = self.pi._distribution(obs)
+            action = distribution.probs.argmax(dim=-1) if isinstance(distribution, Categorical) else distribution.mean
+            return action.cpu().numpy()

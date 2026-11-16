@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
 """
-Training script for Fuz-RL algorithms.
-
-Supports all algorithm variants:
-- Base algorithms: PPO, CPO, CUP
-- Fuzzy variants: FuzPPO, FuzCPO, FuzCUP
-- CVaR variants: CVaR-PPO, CVaR-CPO, CVaR-CUP
+Training entry point for PPO-Lagrangian, Fuz-PPO-Lagrangian and CVaR-PPO-Lagrangian.
 """
 
 import argparse
 import os
 import sys
-import importlib
 import numpy as np
 import warnings
 
 # Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
 
-from spinup.utils.run_utils import call_experiment
 
 # Algorithms are imported individually based on selection
 
@@ -148,358 +141,10 @@ class SwanLabEpochLogger:
         return getattr(self.original_logger, name)
 
 
-class EnvironmentNoiseWrapper:
-    """Wrapper to add noise to environment dynamics, observations, and actions.
-    Matches SafetyGymPerturbWrapper behavior for Safety-Gymnasium environments."""
-
-    def __init__(self, env, train_eps=1.0, disturb_part='dynamics', disturb_type='white_noise'):
-        self.env = env
-        self.train_eps = train_eps
-        self.disturb_part = disturb_part
-        self.disturb_type = disturb_type
-
-        # Configure noise parameters based on type and part
-        self._setup_noise_config()
-
-        # State for impulse and periodic disturbances
-        self.step_count = 0
-        self.impulse_active = False
-        self.impulse_step = 0
-
-        # SafetyGymPerturbWrapper style state
-        self._dyn_active = False
-        self._dyn_steps_left = 0
-        self._fric_base = None
-        self._fric_delta = None
-        self._act_active = False
-        self._act_steps_left = 0
-        self._act_noise_vec = None
-
-        # Detect environment type
-        self._is_point = ("SafetyPoint" in getattr(env, 'spec', {}).id if hasattr(env, 'spec') else "Point" in str(env))
-        self._is_safety_gym = hasattr(env, 'task') or hasattr(env, 'data')
-
-        # Detect return format by doing a test step (if possible)
-        self._detect_return_format()
-
-    def _detect_return_format(self):
-        """Detect the return format of the underlying environment by doing a test step."""
-        try:
-            # Save current state
-            original_state = self.env.reset()
-
-            # Take a test step with a zero action
-            test_action = np.zeros(self.env.action_space.shape, dtype=np.float32)
-            step_result = self.env.step(test_action)
-
-            # Check the number of return values
-            if len(step_result) == 6:
-                self.return_format = 'safety'  # obs, reward, cost, terminated, truncated, info
-            elif len(step_result) in [4, 5]:
-                self.return_format = 'standard'  # obs, reward, terminated, truncated, info
-            else:
-                # Fallback
-                self.return_format = 'standard'
-
-            # Reset environment to original state
-            self.env.reset()
-
-        except Exception as e:
-            # If detection fails, assume standard format
-            print(f"Warning: Could not detect return format ({e}), assuming standard format")
-            self.return_format = 'standard'
-
-    def _setup_noise_config(self):
-        """Setup noise configuration based on disturbance type and part."""
-        self.noise_config = {}
-
-        if self.disturb_type == 'white_noise':
-            if self.disturb_part in ['dynamics', 'observation', 'action', 'multi_source']:
-                # White noise parameters
-                if 'Point' in self.env.unwrapped.spec.id:
-                    # Point environments - match Fuz-RL train_fuzzy.py scaling
-                    obs_sigma = self.train_eps * 1.0  # ±10~50 for observations (match Fuz-RL)
-                    dyn_sigma_qvel = self.train_eps * 0.5  # ±5 for dynamics (match Fuz-RL)
-                    dyn_sigma_fric = self.train_eps * 0.1  # base friction = 1.0 (match Fuz-RL)
-                    action_sigma = self.train_eps * 0.1  # [-1, 1] for actions (match Fuz-RL)
-                else:
-                    # Default noise scales
-                    obs_sigma = self.train_eps * 0.1
-                    dyn_sigma_qvel = self.train_eps * 0.1
-                    dyn_sigma_fric = self.train_eps * 0.05
-                    action_sigma = self.train_eps * 0.1
-
-                if self.disturb_part in ['dynamics', 'multi_source']:
-                    self.noise_config['dynamics'] = {'std': dyn_sigma_qvel}
-                    self.noise_config['friction'] = {'std': dyn_sigma_fric}
-
-                if self.disturb_part in ['observation', 'multi_source']:
-                    self.noise_config['observation'] = {'std': obs_sigma}
-
-                if self.disturb_part in ['action', 'multi_source']:
-                    self.noise_config['action'] = {'std': action_sigma}
-
-        elif self.disturb_type == 'impulse':
-            # Impulse disturbance - sudden large perturbation
-            magnitude = self.train_eps * 10
-            if self.disturb_part in ['dynamics', 'observation', 'action', 'multi_source']:
-                config = {
-                    'magnitude': magnitude,
-                    'step_offset': 20,  # Start after 20 steps
-                    'duration': 80,     # Last for 80 steps
-                    'decay_rate': 0.9   # Exponential decay
-                }
-
-                if self.disturb_part in ['dynamics', 'multi_source']:
-                    self.noise_config['dynamics_impulse'] = config.copy()
-                if self.disturb_part in ['observation', 'multi_source']:
-                    self.noise_config['observation_impulse'] = config.copy()
-                if self.disturb_part in ['action', 'multi_source']:
-                    self.noise_config['action_impulse'] = config.copy()
-
-        elif self.disturb_type == 'periodic':
-            # Periodic disturbance
-            if self.disturb_part in ['dynamics', 'observation', 'action', 'multi_source']:
-                config = {
-                    'scale': self.train_eps,
-                    'frequency': 1.0  # oscillations per episode (roughly)
-                }
-
-                if self.disturb_part in ['dynamics', 'multi_source']:
-                    self.noise_config['dynamics_periodic'] = config.copy()
-                if self.disturb_part in ['observation', 'multi_source']:
-                    self.noise_config['observation_periodic'] = config.copy()
-                if self.disturb_part in ['action', 'multi_source']:
-                    self.noise_config['action_periodic'] = config.copy()
-
-    def _apply_white_noise(self, value, std):
-        """Apply white noise to a value."""
-        return value + np.random.normal(0, std, size=value.shape)
-
-    def _apply_impulse(self, value, config):
-        """Apply impulse disturbance."""
-        if (self.step_count >= config['step_offset'] and
-            self.step_count < config['step_offset'] + config['duration']):
-            # Impulse is active
-            if not self.impulse_active:
-                self.impulse_active = True
-                self.impulse_step = 0
-
-            if self.impulse_active:
-                decay_factor = config['decay_rate'] ** self.impulse_step
-                impulse = np.random.normal(0, config['magnitude'] * decay_factor, size=value.shape)
-                self.impulse_step += 1
-                return value + impulse
-        else:
-            self.impulse_active = False
-
-        return value
-
-    def _apply_periodic(self, value, config):
-        """Apply periodic disturbance."""
-        phase = 2 * np.pi * config['frequency'] * self.step_count / 1000  # Normalize by episode length
-        periodic_noise = config['scale'] * np.sin(phase)
-        if len(value.shape) > 0:
-            periodic_noise = np.full(value.shape, periodic_noise)
-        return value + periodic_noise
-
-    def _decay_factor(self, kind: str, step_idx: int, total: int) -> float:
-        """Calculate decay factor for disturbances."""
-        if total <= 0:
-            return 0.0
-        t = max(0, min(step_idx, total))
-        if kind == "linear":
-            return (total - t) / total
-        else:  # exp
-            lam = 3.0 / max(1, total)
-            return float(np.exp(-lam * t))
-
-    def _maybe_start_dynamics(self):
-        """Start dynamics disturbance window if needed."""
-        dyn_apply_every = 40  # Match Fuz-RL
-        if (not self._dyn_active) and (self.step_count % max(1, dyn_apply_every) == 0):
-            self._dyn_active = True
-            self._dyn_steps_left = 12  # dyn_duration from Fuz-RL
-            self._fric_delta = None
-
-    def _apply_dynamics(self):
-        """Apply dynamics disturbance - match SafetyGymPerturbWrapper."""
-        if not self._dyn_active:
-            return
-
-        t_rel = 12 - self._dyn_steps_left  # dyn_duration
-        factor = self._decay_factor('exp', t_rel, 12)
-
-        # qvel additive noise - directly modify MuJoCo state
-        if 'dynamics' in self.noise_config and self.noise_config['dynamics']['std'] > 0:
-            try:
-                # Try Safety-Gymnasium style access
-                if hasattr(self.env, 'task'):
-                    qvel = self.env.task.data.qvel
-                    qvel[:] = qvel + np.random.randn(*qvel.shape) * self.noise_config['dynamics']['std'] * factor
-                    import mujoco
-                    mujoco.mj_forward(self.env.task.model, self.env.task.data)
-                # Try direct MuJoCo access
-                elif hasattr(self.env, 'data'):
-                    qvel = self.env.data.qvel
-                    qvel[:] = qvel + np.random.randn(*qvel.shape) * self.noise_config['dynamics']['std'] * factor
-                    import mujoco
-                    mujoco.mj_forward(self.env.model, self.env.data)
-            except Exception as e:
-                # Fallback: apply to observation (less accurate but works)
-                pass
-
-        # friction multiplicative drift - Point tasks only
-        if self._is_point and 'friction' in self.noise_config and self.noise_config['friction']['std'] > 0:
-            try:
-                if hasattr(self.env, 'task'):
-                    if self._fric_base is None:
-                        self._fric_base = self.env.task.model.geom_friction.copy()
-                    if self._fric_delta is None:
-                        self._fric_delta = 1.0 + np.random.randn(*self._fric_base.shape) * self.noise_config['friction']['std']
-                    fric_target = self._fric_base * (1.0 + (self._fric_delta - 1.0) * factor)
-                    self.env.task.model.geom_friction[:] = np.clip(fric_target, 0.0, np.inf)
-                    import mujoco
-                    mujoco.mj_forward(self.env.task.model, self.env.task.data)
-            except Exception as e:
-                pass
-
-        self._dyn_steps_left -= 1
-        if self._dyn_steps_left <= 0:
-            self._dyn_active = False
-            # Reset friction at end
-            if self._fric_base is not None and hasattr(self.env, 'task'):
-                try:
-                    self.env.task.model.geom_friction[:] = self._fric_base
-                    import mujoco
-                    mujoco.mj_forward(self.env.task.model, self.env.task.data)
-                except:
-                    pass
-
-    def _maybe_start_action_pulse(self):
-        """Start action pulse disturbance."""
-        action_pulse_every = 80  # Match Fuz-RL
-        if (not self._act_active) and (self.step_count % max(1, action_pulse_every) == 0):
-            self._act_active = True
-            self._act_steps_left = 10  # action_pulse_duration from Fuz-RL
-            if 'action' in self.noise_config:
-                act_dim = self.env.action_space.shape[0]
-                self._act_noise_vec = np.random.randn(act_dim) * self.noise_config['action']['std']
-
-    def _apply_action_pulse(self, action: np.ndarray) -> np.ndarray:
-        """Apply action pulse disturbance."""
-        if not self._act_active or self._act_noise_vec is None:
-            return action
-
-        t_rel = 10 - self._act_steps_left  # action_pulse_duration
-        factor = self._decay_factor('exp', t_rel, 10)
-        a = action + factor * self._act_noise_vec
-        a = np.clip(a, self.env.action_space.low, self.env.action_space.high)
-
-        self._act_steps_left -= 1
-        if self._act_steps_left <= 0:
-            self._act_active = False
-            self._act_noise_vec = None
-
-        return a
-
-    def step(self, action):
-        """Step environment with noise applied - match SafetyGymPerturbWrapper behavior."""
-        self.step_count += 1
-
-        # Start disturbance windows if needed
-        self._maybe_start_dynamics()
-        self._maybe_start_action_pulse()
-
-        # Apply action pulse 
-        if self._act_active:
-            action = self._apply_action_pulse(action)
-
-        # Apply simple action noise if configured (fallback)
-        if 'action' in self.noise_config and not self._act_active:
-            action = self._apply_white_noise(action, self.noise_config['action']['std'])
-
-        # Clip action to valid range
-        action = np.clip(action, self.env.action_space.low, self.env.action_space.high)
-
-        # Step the environment
-        step_result = self.env.step(action)
-
-        # Apply dynamics disturbance immediately after step (before observation noise)
-        self._apply_dynamics()
-
-        # Apply noise based on the detected return format
-        if self.return_format == 'safety':
-            # Safety environments: obs, reward, cost, terminated, truncated, info
-            obs, reward, cost, terminated, truncated, info = step_result
-
-            # Apply observation noise
-            if 'observation' in self.noise_config:
-                obs = self._apply_white_noise(obs, self.noise_config['observation']['std'])
-            elif 'observation_impulse' in self.noise_config:
-                obs = self._apply_impulse(obs, self.noise_config['observation_impulse'])
-            elif 'observation_periodic' in self.noise_config:
-                obs = self._apply_periodic(obs, self.noise_config['observation_periodic'])
-                obs[noise_indices] = self._apply_impulse(obs[noise_indices],
-                                                        self.noise_config['dynamics_impulse'])
-            elif 'dynamics_periodic' in self.noise_config and hasattr(obs, '__len__') and len(obs) > 4:
-                obs = np.array(obs, dtype=np.float32)
-                noise_indices = slice(0, min(4, len(obs)//2))
-                obs[noise_indices] = self._apply_periodic(obs[noise_indices],
-                                                         self.noise_config['dynamics_periodic'])
-
-            return obs, reward, cost, terminated, truncated, info
-
-        else:
-            # Standard environments: handle both 4-value and 5-value formats
-            if len(step_result) == 4:
-                obs, reward, terminated, info = step_result
-                truncated = False
-            elif len(step_result) == 5:
-                obs, reward, terminated, truncated, info = step_result
-            else:
-                raise ValueError(f"Unexpected return format for standard environment: {len(step_result)} values")
-
-            # Apply observation noise
-            if 'observation' in self.noise_config:
-                obs = self._apply_white_noise(obs, self.noise_config['observation']['std'])
-            elif 'observation_impulse' in self.noise_config:
-                obs = self._apply_impulse(obs, self.noise_config['observation_impulse'])
-            elif 'observation_periodic' in self.noise_config:
-                obs = self._apply_periodic(obs, self.noise_config['observation_periodic'])
-
-            # Apply dynamics noise (simplified)
-            if 'dynamics' in self.noise_config and hasattr(obs, '__len__') and len(obs) > 4:
-                noise_indices = slice(0, min(4, len(obs)//2))
-                obs = np.array(obs, dtype=np.float32)
-                obs[noise_indices] = self._apply_white_noise(obs[noise_indices],
-                                                            self.noise_config['dynamics']['std'])
-            elif 'dynamics_impulse' in self.noise_config and hasattr(obs, '__len__') and len(obs) > 4:
-                obs = np.array(obs, dtype=np.float32)
-                noise_indices = slice(0, min(4, len(obs)//2))
-                obs[noise_indices] = self._apply_impulse(obs[noise_indices],
-                                                        self.noise_config['dynamics_impulse'])
-            elif 'dynamics_periodic' in self.noise_config and hasattr(obs, '__len__') and len(obs) > 4:
-                obs = np.array(obs, dtype=np.float32)
-                noise_indices = slice(0, min(4, len(obs)//2))
-                obs[noise_indices] = self._apply_periodic(obs[noise_indices],
-                                                         self.noise_config['dynamics_periodic'])
-
-            return obs, reward, terminated, truncated, info
-
-    def reset(self, **kwargs):
-        """Reset environment and noise state."""
-        self.step_count = 0
-        self.impulse_active = False
-        self.impulse_step = 0
-        return self.env.reset(**kwargs)
-
-    def __getattr__(self, name):
-        """Delegate other attributes to the wrapped environment."""
-        return getattr(self.env, name)
+from spinup.utils.noise import EnvironmentNoiseWrapper
 
 
-def create_environment(env_name, train_eps=1.0, disturb_part='dynamics', disturb_type='white_noise', **env_kwargs):
+def create_environment(env_name, train_eps=0.0, disturb_part='observation', disturb_type='white_noise', **env_kwargs):
     """Create environment based on name with optional noise wrapper."""
     def _make_env():
         if env_name.startswith('Safety'):
@@ -566,10 +211,10 @@ def main():
     parser.add_argument('--fuz_freq', type=int, default=2, help='Fuzzy update frequency')
     parser.add_argument('--repeat_times', type=int, default=1, help='Number of repeats per fuzzy level')
     parser.add_argument('--eps', type=float, default=0.1, help='Perturbation magnitude')
-    parser.add_argument('--train_eps', type=float, default=1.0, help='Training perturbation magnitude')
+    parser.add_argument('--train_eps', type=float, default=0.0, help='Training perturbation magnitude')
     parser.add_argument('--disturb_part', type=str,
                        choices=['dynamics', 'observation', 'action', 'multi_source'],
-                       default='dynamics', help='Part of the system to apply disturbance')
+                       default='observation', help='Part of the system to apply disturbance')
     parser.add_argument('--disturb_type', type=str,
                        choices=['white_noise', 'impulse', 'periodic'],
                        default='white_noise', help='Type of disturbance to apply')
@@ -604,7 +249,15 @@ def main():
     parser.add_argument('--num_cpu', type=str, default='1',
                        help='Number of CPUs to use for MPI (default: 1, use "auto" for all available cores)')
 
+    parser.add_argument('--train_pi_iters', type=int, default=80)
+    parser.add_argument('--train_v_iters', type=int, default=80)
     args = parser.parse_args()
+    if not 0 < args.alpha <= 1:
+        parser.error('alpha must be in (0, 1]')
+    if args.level < 2 or args.fuz_freq < 1 or args.repeat_times < 1:
+        parser.error('level must be >= 2; fuz_freq and repeat_times must be positive')
+    if not np.isfinite([args.eps, args.train_eps, args.cost_limit]).all() or min(args.eps, args.train_eps, args.cost_limit) < 0:
+        parser.error('eps, train_eps and cost_limit must be finite and nonnegative')
 
     # Set experiment name with timestamp
     if args.exp_name is None:
@@ -613,7 +266,12 @@ def main():
         args.exp_name = f"{args.algorithm}_{args.env}_{args.seed}_{timestamp}"
 
     # Parse hidden sizes
-    hidden_sizes = tuple(int(x) for x in args.hidden_sizes.split(','))
+    try:
+        hidden_sizes = tuple(int(x) for x in args.hidden_sizes.split(','))
+        if not hidden_sizes or min(hidden_sizes) <= 0:
+            raise ValueError
+    except ValueError:
+        parser.error('hidden_sizes must contain positive integers separated by commas')
 
     # Set device
     if args.device == 'auto':
@@ -648,6 +306,8 @@ def main():
         'seed': args.seed,
         'steps_per_epoch': args.steps_per_epoch,
         'epochs': args.epochs,
+        'train_pi_iters': args.train_pi_iters,
+        'train_v_iters': args.train_v_iters,
         'max_ep_len': args.max_ep_len,
         'pi_lr': args.pi_lr,
         'vf_lr': args.vf_lr,
@@ -732,45 +392,39 @@ def main():
 
         swanlab_logger.log_config(config_to_log)
 
-    # Define training thunk for call_experiment
-    def training_thunk(**kwargs):
-        # In multi-process mode, we disable SwanLab logging to avoid import issues in worker processes
-        try:
-            # Create a copy of common_kwargs for the algorithm
-            algo_kwargs = common_kwargs.copy()
-
-            # Remove swanlab_logger from logger_kwargs to prevent algorithms from trying to import it
-            if 'logger_kwargs' in algo_kwargs and isinstance(algo_kwargs['logger_kwargs'], dict):
-                algo_kwargs['logger_kwargs'] = algo_kwargs['logger_kwargs'].copy()
-                algo_kwargs['logger_kwargs'].pop('swanlab_logger', None)
-
-            algorithm_fn(**algo_kwargs)
-        finally:
-            pass  # No SwanLab cleanup needed in worker processes
-
-    # Run training
-    print(f"Starting training with {args.algorithm} on {args.env}")
-    print(f"Logs will be saved to: {common_kwargs['logger_kwargs']['output_dir']}")
-
-    # Check if we need multi-CPU support
-    num_cpu = int(args.num_cpu) if args.num_cpu != 'auto' else 'auto'
-
-    if num_cpu == 1 or num_cpu == 'auto':
-        # Single process mode - direct execution with full SwanLab support
-        print("Using single CPU core (no MPI parallelization)")
+    num_cpu = (os.cpu_count() or 1) if args.num_cpu == 'auto' else int(args.num_cpu)
+    if num_cpu < 1:
+        parser.error('num_cpu must be positive or auto')
+    if num_cpu > 1 and swanlab_logger:
+        parser.error('SwanLab currently supports single-process runs only')
+    from spinup.utils.mpi_tools import mpi_fork
+    mpi_fork(num_cpu)
+    from spinup.utils.mpi_tools import proc_id, mpi_sum
+    from pathlib import Path
+    output = Path(common_kwargs['logger_kwargs']['output_dir'])
+    occupied = (output / 'progress.txt').exists() if proc_id() == 0 else False
+    if mpi_sum(int(occupied)):
+        raise FileExistsError(f"Run already exists: {output}. Choose a new exp_name.")
+    if proc_id() == 0:
+        import json
+        import platform
+        import subprocess
+        from pathlib import Path
+        import torch
+        output = Path(common_kwargs['logger_kwargs']['output_dir'])
+        output.mkdir(parents=True, exist_ok=True)
+        manifest = {k: v for k, v in vars(args).items() if k != 'swanlab_api_key'}
+        revision = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=Path(__file__).resolve().parents[1],
+                                  capture_output=True, text=True)
+        manifest.update(python=platform.python_version(), torch=torch.__version__, numpy=np.__version__,
+                        git_commit=revision.stdout.strip() if revision.returncode == 0 else None)
+        (output / 'run.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    print(f"Starting {args.algorithm} on {args.env} with {args.device}")
+    try:
         algorithm_fn(**common_kwargs)
-    else:
-        # Multi-process mode - use call_experiment with SwanLab disabled in workers
-        print(f"Using {num_cpu} CPU cores for MPI parallel training")
-
-        # Use call_experiment for multi-CPU support
-        call_experiment(
-            exp_name=exp_name,
-            thunk=training_thunk,
-            seed=args.seed,
-            num_cpu=num_cpu,
-            data_dir=args.log_dir
-        )
+    finally:
+        if swanlab_logger:
+            swanlab_logger.finish()
 
     print("Training completed!")
 

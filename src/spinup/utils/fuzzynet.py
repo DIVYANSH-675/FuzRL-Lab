@@ -69,13 +69,13 @@ class FuzzyNet(nn.Module):
         Returns:
             g: [batch_size, K] fuzzy densities in (ε, 1-ε)
         """
-        state = state.to(self.device)
+        state = state.to(self.density_head.weight.device)
         
         # Handle batch input
         original_shape = state.shape
         if len(original_shape) == 3:  # [B, K, D]
             B, K, D = original_shape
-            state = state.view(-1, D)  # [B*K, D]
+            state = state.reshape(-1, D)  # [B*K, D]
         
         # Encode and generate logits
         h = self.encoder(state)  # [B(*K), hidden_dim]
@@ -86,7 +86,7 @@ class FuzzyNet(nn.Module):
             # Softmax normalization: sum to 1
             g = F.softmax(logits, dim=-1)
             # Add small noise to avoid exact 0 or 1
-            g = g * (1 - 2 * self._eps) + self._eps
+            g = (1 - self._eps) * g + self._eps / self.n_singletons
         else:
             # Sigmoid: each g_i ∈ (0, 1) independently
             g = torch.sigmoid(logits)

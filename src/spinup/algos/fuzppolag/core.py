@@ -1,6 +1,9 @@
 import numpy as np
 import scipy.signal
-from gym.spaces import Box, Discrete
+try:
+    from gym.spaces import Box, Discrete
+except ImportError:
+    from gymnasium.spaces import Box, Discrete
 
 import torch
 import torch.nn as nn
@@ -140,7 +143,9 @@ class MLPActorCritic(nn.Module):
         return a.cpu().numpy(), v.cpu().numpy(), vc.cpu().numpy(), logp_a.cpu().numpy()
 
     def act(self, obs, deterministic=False):
-        if not deterministic:
-            return self.step(obs)[0]
-        else:
-            return self.pi.mu_net(obs)
+        with torch.no_grad():
+            if not deterministic:
+                return self.step(obs)[0]
+            distribution = self.pi._distribution(obs)
+            action = distribution.probs.argmax(dim=-1) if isinstance(distribution, Categorical) else distribution.mean
+            return action.cpu().numpy()

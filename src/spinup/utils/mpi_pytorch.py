@@ -32,19 +32,16 @@ def mpi_avg_grads(module):
 
     for p in params:
         if p.grad is not None:
-            p_grad_numpy = p.grad.cpu().numpy()   # numpy view of tensor data
-            avg_p_grad = mpi_avg(p.grad.cpu())
-            if p_grad_numpy.ndim == 0:
-                # Scalar parameter - direct assignment
-                p.grad.copy_(avg_p_grad)
-            else:
-                # Array parameter - slice assignment
-                p_grad_numpy[:] = avg_p_grad[:]
+            averaged = mpi_avg(p.grad.detach().cpu().numpy())
+            p.grad.copy_(torch.as_tensor(averaged, dtype=p.grad.dtype, device=p.grad.device))
+
 
 def sync_params(module):
-    """ Sync all parameters of module across all MPI processes. """
-    if num_procs()==1:
+    """Broadcast parameters and copy results back to their original device."""
+    if num_procs() == 1:
         return
     for p in module.parameters():
-        p_numpy = p.data.cpu().numpy()
-        broadcast(p_numpy)
+        values = p.detach().cpu().numpy().copy()
+        broadcast(values)
+        with torch.no_grad():
+            p.copy_(torch.as_tensor(values, dtype=p.dtype, device=p.device))

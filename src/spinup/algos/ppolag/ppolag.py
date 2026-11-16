@@ -1,7 +1,8 @@
+from spinup.utils.env_api import reset_env, step_env
+from spinup.utils.training import normalize_advantages, penalty_loss, validate_training
 import numpy as np
 import torch
 from torch.optim import Adam
-import gym
 import time
 import sys
 import os
@@ -10,8 +11,6 @@ from spinup.utils.logx import EpochLogger
 from spinup.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 from torch.nn.functional import softplus
-torch.autograd.set_detect_anomaly(True)
-import safety_gymnasium
 from spinup.utils.run_utils import setup_logger_kwargs
 
 class PPOBuffer:
@@ -105,10 +104,9 @@ class PPOBuffer:
         assert self.ptr == self.max_size    # buffer has to be full before you can get
         self.ptr, self.path_start_idx = 0, 0
         # the next two lines implement the advantage normalization trick
-        adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
         cadv_mean, cadv_std = mpi_statistics_scalar(self.cadv_buf)
 
-        self.adv_buf = (self.adv_buf - adv_mean) / adv_std
+        self.adv_buf = normalize_advantages(self.adv_buf)
         self.cadv_buf = (self.cadv_buf - cadv_mean) #/ adv_std
 
         data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf, cret=self.cret_buf,
@@ -123,6 +121,8 @@ def ppolag(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, e
         target_kl=0.01, logger_kwargs=dict(), save_freq=100, cost_limit=25.0):
 
     # Special function to avoid certain slowdowns from PyTorch + MPI combo.
+    validate_training(steps_per_epoch, epochs, train_pi_iters, train_v_iters, max_ep_len, save_freq, num_procs())
+    logger_kwargs = dict(logger_kwargs)
     setup_pytorch_for_mpi()
 
     # Set up logger and save configuration
@@ -203,7 +203,7 @@ def ppolag(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, e
     # Set up optimizers for policy and value function
     # pi_lr = 3e-4
     pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
-    penalty_param = torch.tensor(1.0,requires_grad=True).float()
+    penalty_param = torch.tensor(1.0, requires_grad=True, device=device)
     penalty = softplus(penalty_param)
     
 
@@ -221,16 +221,20 @@ def ppolag(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, e
         except (KeyError, IndexError):
             # If no EpRisk data yet, use default cost limit
             cur_cost = cost_limit
+        has_cost = np.isfinite(cur_cost)
+        if not has_cost:
+            cur_cost = cost_limit  # No completed episodes: leave multiplier unchanged.
         data = buf.get()
         data['cur_cost'] = cur_cost
         data['cur_penalty'] = penalty_param
         pi_l_old, cost_dev, pi_info_old = compute_loss_pi(data)
 
-        loss_penalty = penalty_param * cost_dev 
+        loss_penalty = penalty_loss(penalty_param, cost_dev)
         penalty_optimizer.zero_grad()
         loss_penalty.backward()
         mpi_avg_grads(penalty_param)
-        penalty_optimizer.step()
+        if has_cost:
+            penalty_optimizer.step()
 
         data['cur_penalty'] = penalty_param
 
@@ -275,21 +279,13 @@ def ppolag(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, e
         
     # Prepare for interaction with environment
     start_time = time.time()
-    o, ep_ret, ep_cret, ep_len = env.reset()[0], 0, 0, 0
+    o, ep_ret, ep_cret, ep_len = reset_env(env, seed=seed), 0, 0, 0
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
         for t in range(local_steps_per_epoch):
             a, v, vc, logp = ac.step(torch.as_tensor(o, dtype=torch.float32).to(device))
-            if env_name in ['DoubleIntegrator']:
-                truncated = False
-                next_o, r, d, infos = env.step(a)
-                c = infos['constraint_violation']
-            elif env_name in ['SafetyPointGoal1-v0', 'SafetyPointPush1-v0', 'SafetyPointButton1-v0', 'SafetyPointCircle1-v0', 'SafetyWalker2dVelocity-v1', 'SafetyHalfCheetahVelocity-v1', 'SafetyHopperVelocity-v1', 'SafetySwimmerVelocity-v1']:
-                next_o, r, c, d, truncated, infos = env.step(a)
-            elif env_name in ['CartPole', 'QuadRotor', 'QuadRotor3D']:
-                truncated = False
-                next_o, r, d, infos = env.step(a)
-                c = infos['constraint_violation']
+            next_o, r, c, d, truncated, infos = step_env(env, a)
+
             ep_ret += r
             ep_cret += c
             ep_len += 1
@@ -310,8 +306,8 @@ def ppolag(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, e
                 if epoch_ended and not(terminal):
                     print('Warning: trajectory cut off by epoch at %d steps.'%ep_len, flush=True)
                 # if trajectory didn't reach terminal state, bootstrap value target
-                if timeout or epoch_ended:
-                        _, v, vc, _ = ac.step(torch.as_tensor(o, dtype=torch.float32).to(device))
+                if not d:  # Bootstrap truncations, but never true terminal states.
+                    _, v, vc, _ = ac.step(torch.as_tensor(o, dtype=torch.float32).to(device))
                 else:
                     v = 0
                     vc = 0
@@ -319,18 +315,17 @@ def ppolag(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, e
                 if terminal:
                     # only save EpRet / EpLen if trajectory finished
                     logger.store(EpRet=ep_ret, EpLen=ep_len, EpRisk=ep_cret)
-                    o, ep_ret, ep_cret, ep_len = env.reset()[0], 0, 0, 0
+                    o, ep_ret, ep_cret, ep_len = reset_env(env), 0, 0, 0
 
 
-        # Save model
+        update()
         if (epoch % save_freq == 0) or (epoch == epochs-1):
             logger.save_state({'env': env}, epoch)
 
-        # Perform PPO update!
-        update()
-
         # Log info about epoch
         logger.log_tabular('Epoch', epoch)
+        logger.log_tabular('Penalty', softplus(penalty_param).item())
+        logger.log_tabular('Episodes', int(mpi_avg(len(logger.epoch_dict.get('EpRet', []))) * num_procs()))
         try:
             logger.log_tabular('EpRet', average_only=True)
         except KeyError:
@@ -357,3 +352,4 @@ def ppolag(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, e
         logger.log_tabular('StopIter', average_only=True)
         logger.log_tabular('Time', time.time()-start_time)
         logger.dump_tabular()
+    env.close()

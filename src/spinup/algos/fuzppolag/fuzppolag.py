@@ -1,7 +1,8 @@
+from spinup.utils.env_api import reset_env, step_env
+from spinup.utils.training import normalize_advantages, penalty_loss, validate_training
 import numpy as np
 import torch
 from torch.optim import Adam
-import gym
 import time
 import sys
 import os
@@ -109,11 +110,9 @@ class FuzBuffer:
         assert self.ptr == self.max_size
         self.ptr, self.path_start_idx = 0, 0
         
-        adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
-        cadv_mean, cadv_std = mpi_statistics_scalar(self.cadv_buf)
 
-        self.adv_buf = (self.adv_buf - adv_mean) / adv_std
-        self.cadv_buf = (self.cadv_buf - cadv_mean) / cadv_std
+        self.adv_buf = normalize_advantages(self.adv_buf)
+        self.cadv_buf = normalize_advantages(self.cadv_buf)
 
         data = dict(
             obs=self.obs_buf, 
@@ -169,8 +168,11 @@ def fuzzyppolag(
     train_eps=1.0,
     cost_limit=25.0,
 ):
-    warnings.filterwarnings('ignore')
+    if level < 2 or repeat_times < 1 or fuz_freq < 1 or not np.isfinite(eps) or eps < 0:
+        raise ValueError("Invalid fuzzy level, repetition, update frequency or perturbation radius")
     # Setup MPI and PyTorch
+    validate_training(steps_per_epoch, epochs, train_pi_iters, train_v_iters, max_ep_len, save_freq, num_procs())
+    logger_kwargs = dict(logger_kwargs)
     setup_pytorch_for_mpi()
     # Logger configuration with SwanLab support
     swanlab_logger = logger_kwargs.pop('swanlab_logger', None)
@@ -326,17 +328,21 @@ def fuzzyppolag(
         except (KeyError, IndexError):
             # If no EpRisk data yet, use default cost limit
             cur_cost = cost_limit
+        has_cost = np.isfinite(cur_cost)
+        if not has_cost:
+            cur_cost = cost_limit  # No completed episodes: leave multiplier unchanged.
         data = buf.get()
         data['cur_cost'] = cur_cost
         data['cur_penalty'] = penalty_param
         pi_l_old, cost_dev, pi_info_old = compute_loss_pi(data)
 
         # Update penalty parameter
-        loss_penalty = penalty_param * cost_dev 
+        loss_penalty = penalty_loss(penalty_param, cost_dev)
         penalty_optimizer.zero_grad()
         loss_penalty.backward()
         mpi_avg_grads(penalty_param)
-        penalty_optimizer.step()
+        if has_cost:
+            penalty_optimizer.step()
 
         data['cur_penalty'] = penalty_param
 
@@ -397,7 +403,7 @@ def fuzzyppolag(
     
     # Main loop for interacting with the environment
     start_time = time.time()
-    o, ep_ret, ep_cret, ep_len = env.reset()[0], 0, 0, 0
+    o, ep_ret, ep_cret, ep_len = reset_env(env, seed=seed), 0, 0, 0
     
     best_ep_ret = -np.inf
     best_epoch = -1
@@ -407,16 +413,7 @@ def fuzzyppolag(
             a, v, vc, logp = ac.step(torch.as_tensor(o, dtype=torch.float32).to(device))
             
 
-            if env_name in ['DoubleIntegrator']:
-                truncated = False
-                next_o, r, d, infos = env.step(a)
-                c = infos['constraint_violation']
-            elif env_name in ["SafetyPointGoal1-v0", "SafetyPointButton1-v0", "SafetyPointPush1-v0", "SafetyPointCircle1-v0", 'SafetyWalker2dVelocity-v1', 'SafetyHalfCheetahVelocity-v1', 'SafetyHopperVelocity-v1', 'SafetySwimmerVelocity-v1']:
-                next_o, r, c, d, truncated, infos = env.step(a)
-            elif env_name in ['CartPole', 'QuadRotor', 'QuadRotor3D']:
-                truncated = False
-                next_o, r, d, infos = env.step(a)
-                c = infos['constraint_violation']
+            next_o, r, c, d, truncated, infos = step_env(env, a)
 
             batch_size = level * repeat_times
             next_o_np = next_o.cpu().numpy() if isinstance(next_o, torch.Tensor) else next_o
@@ -452,6 +449,11 @@ def fuzzyppolag(
                     torch.tensor(next_vc_distrib_np).unsqueeze(0).to(device),
                 ).squeeze().item()
 
+            if d:
+                next_v_distrib_np = np.zeros_like(next_v_distrib_np)
+                next_vc_distrib_np = np.zeros_like(next_vc_distrib_np)
+                fuzzy_v_next_np = fuzzy_vc_next_np = 0.0
+
             ep_ret += r
             ep_cret += c
             ep_len += 1
@@ -484,7 +486,7 @@ def fuzzyppolag(
                 if epoch_ended and not(terminal):
                     print(f'Warning: trajectory truncated at {ep_len} steps', flush=True)
                 
-                if timeout or epoch_ended:
+                if not d:  # Bootstrap truncations, but never true terminal states.
                     _, v, vc, _ = ac.step(torch.as_tensor(o, dtype=torch.float32).to(device))
                 else:
                     v = 0
@@ -493,8 +495,7 @@ def fuzzyppolag(
                 
                 if terminal:
                     logger.store(EpRet=ep_ret, EpLen=ep_len, EpRisk=ep_cret)
-                
-                o, ep_ret, ep_cret, ep_len = env.reset()[0], 0, 0, 0
+                    o, ep_ret, ep_cret, ep_len = reset_env(env), 0, 0, 0
         
         try:
             current_ep_ret = logger.get_stats('EpRet')[0]
@@ -505,12 +506,13 @@ def fuzzyppolag(
             best_ep_ret = current_ep_ret
             if proc_id() == 0:  
                 print(f'✓ New best model saved at epoch {epoch} with EpRet={best_ep_ret:.3f}')
+        update(epoch)
         if (epoch % save_freq == 0) or (epoch == epochs - 1):
             logger.save_state({'env': env}, epoch)
-
-        update(epoch)
         
         logger.log_tabular('Epoch', epoch)
+        logger.log_tabular('Penalty', softplus(penalty_param).item())
+        logger.log_tabular('Episodes', int(mpi_avg(len(logger.epoch_dict.get('EpRet', []))) * num_procs()))
         try:
             logger.log_tabular('EpRet', average_only=True)
         except KeyError:
@@ -542,6 +544,8 @@ def fuzzyppolag(
         logger.log_tabular('Time', time.time() - start_time)
         logger.dump_tabular()
         
+    env.close()
+
 
 """
 Quick check for FuzzyNet module when running this file directly.

@@ -333,6 +333,8 @@ class Logger:
                 # We use a catch_warnings() context to avoid the warnings about
                 # not being able to save the source code.
                 torch.save(self.pytorch_saver_elements, fname)
+                weights_path = osp.join(fpath, 'weights' + (str(itr) if itr is not None else '') + '.pt')
+                torch.save(self.pytorch_saver_elements.state_dict(), weights_path)
 
     def dump_tabular(self):
         """
@@ -425,8 +427,8 @@ class EpochLogger(Logger):
         if val is not None:
             super().log_tabular(key,val)
         else:
-            v = self.epoch_dict[key]
-            vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
+            v = self.epoch_dict.get(key, [])
+            vals = np.concatenate(v) if v and isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
             stats = mpi_statistics_scalar(vals, with_min_and_max=with_min_and_max)
             super().log_tabular(key if average_only else 'Average' + key, stats[0])
             if not(average_only):
@@ -440,8 +442,8 @@ class EpochLogger(Logger):
         """
         Lets an algorithm ask the logger for mean/std/min/max of a diagnostic.
         """
-        v = self.epoch_dict[key]
-        vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
+        v = self.epoch_dict.get(key, [])
+        vals = np.concatenate(v) if v and isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
         return mpi_statistics_scalar(vals)
 
     def get_cost_stats(self, key):

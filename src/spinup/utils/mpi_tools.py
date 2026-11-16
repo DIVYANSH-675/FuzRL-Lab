@@ -1,6 +1,15 @@
-from mpi4py import MPI
 import os, subprocess, sys
 import numpy as np
+
+try:
+    from mpi4py import MPI
+except (ImportError, RuntimeError):
+    MPI = None
+    # Never silently train independent replicas when launched under MPI.
+    if any(int(os.environ.get(key, '1')) > 1 for key in
+           ('OMPI_COMM_WORLD_SIZE', 'PMI_SIZE', 'PMIX_SIZE')) or os.getenv('IN_MPI'):
+        raise RuntimeError("MPI workers require mpi4py and a working MPI runtime")
+
 
 
 def mpi_fork(n, bind_to_core=False):
@@ -21,6 +30,8 @@ def mpi_fork(n, bind_to_core=False):
     """
     if n<=1: 
         return
+    if MPI is None:
+        raise RuntimeError("Install the mpi extra and an MPI runtime before requesting multiple workers")
     if os.getenv("IN_MPI") is None:
         env = os.environ.copy()
         env.update(
@@ -37,31 +48,35 @@ def mpi_fork(n, bind_to_core=False):
 
 
 def msg(m, string=''):
-    print(('Message from %d: %s \t '%(MPI.COMM_WORLD.Get_rank(), string))+str(m))
+    print(('Message from %d: %s \t '%((MPI.COMM_WORLD.Get_rank() if MPI is not None else 0), string))+str(m))
 
 def proc_id():
     """Get rank of calling process."""
-    return MPI.COMM_WORLD.Get_rank()
+    return (MPI.COMM_WORLD.Get_rank() if MPI is not None else 0)
 
 def allreduce(*args, **kwargs):
     return MPI.COMM_WORLD.Allreduce(*args, **kwargs)
 
 def num_procs():
     """Count active MPI processes."""
-    return MPI.COMM_WORLD.Get_size()
+    return (MPI.COMM_WORLD.Get_size() if MPI is not None else 1)
 
 def broadcast(x, root=0):
-    MPI.COMM_WORLD.Bcast(x, root=root)
+    if MPI is not None:
+        MPI.COMM_WORLD.Bcast(x, root=root)
 
 def mpi_op(x, op):
     x, scalar = ([x], True) if np.isscalar(x) else (x, False)
     x = np.asarray(x, dtype=np.float32)
     buff = np.zeros_like(x, dtype=np.float32)
-    allreduce(x, buff, op=op)
+    if MPI is None:
+        buff[:] = x
+    else:
+        allreduce(x, buff, op=op)
     return buff[0] if scalar else buff
 
 def mpi_sum(x):
-    return mpi_op(x, MPI.SUM)
+    return mpi_op(x, MPI.SUM if MPI is not None else None)
 
 def mpi_avg(x):
     """Average a scalar or vector over MPI processes."""
@@ -80,13 +95,15 @@ def mpi_statistics_scalar(x, with_min_and_max=False):
     """
     x = np.array(x, dtype=np.float32)
     global_sum, global_n = mpi_sum([np.sum(x), len(x)])
+    if global_n == 0:
+        return (np.nan,) * (4 if with_min_and_max else 2)
     mean = global_sum / global_n
 
     global_sum_sq = mpi_sum(np.sum((x - mean)**2))
     std = np.sqrt(global_sum_sq / global_n)  # compute global std
 
     if with_min_and_max:
-        global_min = mpi_op(np.min(x) if len(x) > 0 else np.inf, op=MPI.MIN)
-        global_max = mpi_op(np.max(x) if len(x) > 0 else -np.inf, op=MPI.MAX)
+        global_min = mpi_op(np.min(x) if len(x) > 0 else np.inf, op=MPI.MIN if MPI is not None else None)
+        global_max = mpi_op(np.max(x) if len(x) > 0 else -np.inf, op=MPI.MAX if MPI is not None else None)
         return mean, std, global_min, global_max
     return mean, std
